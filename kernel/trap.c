@@ -65,6 +65,36 @@ usertrap(void)
     intr_on();
 
     syscall();
+  } else if(r_scause() == 13 || r_scause() == 15){
+    char *mem;
+    uint64 va = r_stval();
+    // deal wiht page fault where vm addr larger than p->sz or lower than user stack
+    if(va >= p->sz)
+    {
+      printf("usertrap(): invalid va=%p higher than p->sz=%p\n", va, p->sz);
+      p->killed = 1;
+      goto end;
+    }
+    if(va < PGROUNDUP(p->trapframe->sp))
+    {
+      printf("usertrap(): invalid va=%p below the user stack sp=%p\n", va, p->trapframe->sp);
+      p->killed = 1;
+      goto end;
+    }
+    // bad allocation
+    if ((mem=kalloc()) == 0)
+    {
+      p->killed = 1;
+      goto end;
+    }
+    memset(mem, 0, PGSIZE);
+    // page reflection and error
+    if (mappages(p->pagetable, PGROUNDDOWN(r_stval()), PGSIZE, (uint64)mem, PTE_W | PTE_X | PTE_R | PTE_U) != 0)
+    {
+      kfree(mem);
+      panic("usertrap:mappages");
+      p->killed = 1;
+    }
   } else if((which_dev = devintr()) != 0){
     // ok
   } else {
@@ -73,6 +103,7 @@ usertrap(void)
     p->killed = 1;
   }
 
+end:
   if(p->killed)
     exit(-1);
 
