@@ -15,6 +15,10 @@
 #include "sleeplock.h"
 #include "file.h"
 #include "fcntl.h"
+#include "memlayout.h"  // lab10
+
+#define max(a, b) ((a) > (b) ? (a) : (b))   // lab10
+#define min(a, b) ((a) < (b) ? (a) : (b))   // lab10
 
 // Fetch the nth word-sized system call argument as a file descriptor
 // and return both the descriptor and the corresponding struct file.
@@ -393,7 +397,7 @@ sys_chdir(void)
   char path[MAXPATH];
   struct inode *ip;
   struct proc *p = myproc();
-  
+
   begin_op();
   if(argstr(0, path, MAXPATH) < 0 || (ip = namei(path)) == 0){
     end_op();
@@ -481,6 +485,157 @@ sys_pipe(void)
     fileclose(rf);
     fileclose(wf);
     return -1;
+  }
+  return 0;
+}
+
+// lab10
+uint64 sys_mmap(void) {
+  uint64 addr; // 存储映射的起始地址
+  int len, prot, flags, offset; // 长度、保护模式、标志、偏移量等参数
+  struct file *f; // 文件指针
+  struct vm_area *vma = 0; // 虚拟内存区域指针
+  struct proc *p = myproc(); // 获取当前进程
+  int i;
+
+  // 从用户态获取参数，如果失败则返回-1
+  if (argaddr(0, &addr) < 0 || argint(1, &len) < 0
+      || argint(2, &prot) < 0 || argint(3, &flags) < 0
+      || argfd(4, 0, &f) < 0 || argint(5, &offset) < 0) {
+    return -1;
+  }
+
+  // 检查标志参数，必须是MAP_SHARED或MAP_PRIVATE
+  if (flags != MAP_SHARED && flags != MAP_PRIVATE) {
+    return -1;
+  }
+
+  // 当标志为MAP_SHARED时，文件必须可写
+  if (flags == MAP_SHARED && f->writable == 0 && (prot & PROT_WRITE)) {
+    return -1;
+  }
+
+  // 长度和偏移量必须是页大小的倍数
+  if (len < 0 || offset < 0 || offset % PGSIZE) {
+    return -1;
+  }
+
+  // 为映射的内存分配一个VMA（虚拟内存区域）
+  for (i = 0; i < NVMA; ++i) {
+    if (!p->vma[i].addr) {
+      vma = &p->vma[i];
+      break;
+    }
+  }
+  if (!vma) {
+    return -1;
+  }
+
+  // 假设addr始终为0，内核会选择一个页对齐的地址来创建映射
+  addr = MMAPMINADDR;
+  for (i = 0; i < NVMA; ++i) {
+    if (p->vma[i].addr) {
+      // 获取已映射内存的最大地址
+      addr = max(addr, p->vma[i].addr + p->vma[i].len);
+    }
+  }
+  addr = PGROUNDUP(addr);
+  if (addr + len > TRAPFRAME) {
+    return -1;
+  }
+
+  // 设置VMA的属性
+  vma->addr = addr;
+  vma->len = len;
+  vma->prot = prot;
+  vma->flags = flags;
+  vma->offset = offset;
+  vma->f = f;
+  filedup(f); // 增加文件的引用计数
+
+  return addr;
+}
+
+// lab10
+uint64 sys_munmap(void) {
+  uint64 addr, va; // 要解除映射的起始地址和当前地址
+  int len; // 要解除映射的长度
+  struct proc *p = myproc(); // 获取当前进程
+  struct vm_area *vma = 0; // 虚拟内存区域指针
+  uint maxsz, n, n1; // 最大可写入磁盘的大小，循环变量
+  int i;
+
+  // 从用户态获取参数，如果失败则返回-1
+  if (argaddr(0, &addr) < 0 || argint(1, &len) < 0) {
+    return -1;
+  }
+  // 地址必须是页大小的倍数，长度不能小于0
+  if (addr % PGSIZE || len < 0) {
+    return -1;
+  }
+
+  // 查找对应的VMA（虚拟内存区域）
+  for (i = 0; i < NVMA; ++i) {
+    if (p->vma[i].addr && addr >= p->vma[i].addr
+        && addr + len <= p->vma[i].addr + p->vma[i].len) {
+      vma = &p->vma[i];
+      break;
+    }
+  }
+  if (!vma) {
+    return -1;
+  }
+
+  // 如果解除映射的长度为0，则直接返回0
+  if (len == 0) {
+    return 0;
+  }
+
+  // 如果是共享映射（MAP_SHARED），则将脏页写回到映射的文件中
+  if ((vma->flags & MAP_SHARED)) {
+    // 可以写入磁盘的最大大小
+    maxsz = ((MAXOPBLOCKS - 1 - 1 - 2) / 2) * BSIZE;
+    for (va = addr; va < addr + len; va += PGSIZE) {
+      if (uvmgetdirty(p->pagetable, va) == 0) {
+        continue;
+      }
+      // 只将脏页写回到映射的文件中
+      n = min(PGSIZE, addr + len - va);
+      for (i = 0; i < n; i += n1) {
+        n1 = min(maxsz, n - i);
+        begin_op();
+        ilock(vma->f->ip);
+        if (writei(vma->f->ip, 1, va + i, va - vma->addr + vma->offset + i, n1) != n1) {
+          iunlock(vma->f->ip);
+          end_op();
+          return -1;
+        }
+        iunlock(vma->f->ip);
+        end_op();
+      }
+    }
+  }
+
+  // 解除映射
+  uvmunmap(p->pagetable, addr, (len - 1) / PGSIZE + 1, 1);
+
+  // 更新VMA的信息
+  if (addr == vma->addr && len == vma->len) {
+    vma->addr = 0;
+    vma->len = 0;
+    vma->offset = 0;
+    vma->flags = 0;
+    vma->prot = 0;
+    fileclose(vma->f);
+    vma->f = 0;
+  } else if (addr == vma->addr) {
+    vma->addr += len;
+    vma->offset += len;
+    vma->len -= len;
+  } else if (addr + len == vma->addr + vma->len) {
+    vma->len -= len;
+  } else {
+    panic("unexpected munmap");
   }
   return 0;
 }

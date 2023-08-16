@@ -5,6 +5,12 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "fcntl.h"  // lab10
+#include "sleeplock.h"  // lab10
+#include "fs.h"     // lab10
+#include "file.h"   // lab10
+
+#define min(a, b) ((a) < (b) ? (a) : (b))   // lab10
 
 struct cpu cpus[NCPU];
 
@@ -28,7 +34,7 @@ extern char trampoline[]; // trampoline.S
 void
 proc_mapstacks(pagetable_t kpgtbl) {
   struct proc *p;
-  
+
   for(p = proc; p < &proc[NPROC]; p++) {
     char *pa = kalloc();
     if(pa == 0)
@@ -43,7 +49,7 @@ void
 procinit(void)
 {
   struct proc *p;
-  
+
   initlock(&pid_lock, "nextpid");
   for(p = proc; p < &proc[NPROC]; p++) {
       initlock(&p->lock, "proc");
@@ -83,7 +89,7 @@ myproc(void) {
 int
 allocpid() {
   int pid;
-  
+
   acquire(&pid_lock);
   pid = nextpid;
   nextpid = nextpid + 1;
@@ -222,7 +228,7 @@ userinit(void)
 
   p = allocproc();
   initproc = p;
-  
+
   // allocate one user page and copy init's instructions
   // and data into it.
   uvminit(p->pagetable, initcode, sizeof(initcode));
@@ -262,50 +268,60 @@ growproc(int n)
 
 // Create a new process, copying the parent.
 // Sets up child kernel stack to return as if from fork() system call.
-int
-fork(void)
+int fork(void)
 {
-  int i, pid;
-  struct proc *np;
-  struct proc *p = myproc();
+  int i, pid; // 进程ID和循环变量
+  struct proc *np; // 子进程指针
+  struct proc *p = myproc(); // 当前进程指针
 
-  // Allocate process.
-  if((np = allocproc()) == 0){
-    return -1;
+  // 分配新的进程
+  if ((np = allocproc()) == 0) {
+    return -1; // 分配失败，返回-1
   }
 
-  // Copy user memory from parent to child.
-  if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
+  // 复制父进程的用户内存到子进程
+  if (uvmcopy(p->pagetable, np->pagetable, p->sz) < 0) {
     freeproc(np);
     release(&np->lock);
-    return -1;
+    return -1; // 复制失败，释放子进程并返回-1
   }
-  np->sz = p->sz;
+  np->sz = p->sz; // 设置子进程的用户内存大小与父进程一致
 
-  np->parent = p;
+  np->parent = p; // 设置子进程的父进程为当前进程
 
-  // copy saved user registers.
+  // 复制父进程的保存的用户寄存器
   *(np->trapframe) = *(p->trapframe);
 
-  // Cause fork to return 0 in the child.
+  // 使子进程在返回时返回0
   np->trapframe->a0 = 0;
 
-  // increment reference counts on open file descriptors.
-  for(i = 0; i < NOFILE; i++)
-    if(p->ofile[i])
+  // 增加打开文件描述符的引用计数
+  for (i = 0; i < NOFILE; i++) {
+    if (p->ofile[i]) {
       np->ofile[i] = filedup(p->ofile[i]);
-  np->cwd = idup(p->cwd);
+    }
+  }
+  np->cwd = idup(p->cwd); // 复制当前工作目录
 
-  safestrcpy(np->name, p->name, sizeof(p->name));
+  // 复制所有的VMA（虚拟内存区域）
+  for (i = 0; i < NVMA; ++i) {
+    if (p->vma[i].addr) {
+      np->vma[i] = p->vma[i];
+      filedup(np->vma[i].f);
+    }
+  }
 
-  pid = np->pid;
+  safestrcpy(np->name, p->name, sizeof(p->name)); // 复制进程名字
 
-  np->state = RUNNABLE;
+  pid = np->pid; // 获取子进程的ID
 
-  release(&np->lock);
+  np->state = RUNNABLE; // 设置子进程为可运行状态
 
-  return pid;
+  release(&np->lock); // 释放子进程的锁
+
+  return pid; // 返回子进程的ID
 }
+
 
 // Pass p's abandoned children to init.
 // Caller must hold p->lock.
@@ -336,67 +352,88 @@ reparent(struct proc *p)
 // Exit the current process.  Does not return.
 // An exited process remains in the zombie state
 // until its parent calls wait().
-void
-exit(int status)
+void exit(int status)
 {
-  struct proc *p = myproc();
+    struct proc *p = myproc();  // 获取当前进程指针
+    int i;
+    struct vm_area* vma;  // 虚拟内存区域指针
+    uint maxsz = ((MAXOPBLOCKS - 1 - 1 - 2) / 2) * BSIZE;  // 最大大小
+    uint64 va;
+    uint n, n1, r;
 
-  if(p == initproc)
-    panic("init exiting");
+    if(p == initproc)  // 如果当前进程为init进程，则抛出panic异常
+        panic("init exiting");
 
-  // Close all open files.
-  for(int fd = 0; fd < NOFILE; fd++){
-    if(p->ofile[fd]){
-      struct file *f = p->ofile[fd];
-      fileclose(f);
-      p->ofile[fd] = 0;
+    for (i = 0; i < NVMA; ++i) {  // 遍历进程的虚拟内存区域
+        if (p->vma[i].addr == 0) {
+            continue;
+        }
+        vma = &p->vma[i];
+
+        if ((vma->flags & MAP_SHARED)) {  // 如果该区域是共享区域
+            for (va = vma->addr; va < vma->addr + vma->len; va += PGSIZE) {
+                if (uvmgetdirty(p->pagetable, va) == 0) {
+                    continue;
+                }
+                n = min(PGSIZE, vma->addr + vma->len - va);
+                for (r = 0; r < n; r += n1) {
+                    n1 = min(maxsz, n - i);
+                    begin_op();
+                    ilock(vma->f->ip);
+                    if (writei(vma->f->ip, 1, va + i, va - vma->addr + vma->offset + i, n1) != n1) {
+                        iunlock(vma->f->ip);
+                        end_op();
+                        panic("exit: writei failed");
+                    }
+                    iunlock(vma->f->ip);
+                    end_op();
+                }
+            }
+        }
+
+        uvmunmap(p->pagetable, vma->addr, (vma->len - 1) / PGSIZE + 1, 1);  // 取消虚拟内存区域的映射
+        vma->addr = 0;
+        vma->len = 0;
+        vma->offset = 0;
+        vma->flags = 0;
+        vma->offset = 0;
+        fileclose(vma->f);  // 关闭文件
+        vma->f = 0;
     }
-  }
 
-  begin_op();
-  iput(p->cwd);
-  end_op();
-  p->cwd = 0;
+    for(int fd = 0; fd < NOFILE; fd++){  // 关闭所有打开的文件
+        if(p->ofile[fd]){
+            struct file *f = p->ofile[fd];
+            fileclose(f);
+            p->ofile[fd] = 0;
+        }
+    }
 
-  // we might re-parent a child to init. we can't be precise about
-  // waking up init, since we can't acquire its lock once we've
-  // acquired any other proc lock. so wake up init whether that's
-  // necessary or not. init may miss this wakeup, but that seems
-  // harmless.
-  acquire(&initproc->lock);
-  wakeup1(initproc);
-  release(&initproc->lock);
+    begin_op();
+    iput(p->cwd);  // 释放当前工作目录
+    end_op();
+    p->cwd = 0;
 
-  // grab a copy of p->parent, to ensure that we unlock the same
-  // parent we locked. in case our parent gives us away to init while
-  // we're waiting for the parent lock. we may then race with an
-  // exiting parent, but the result will be a harmless spurious wakeup
-  // to a dead or wrong process; proc structs are never re-allocated
-  // as anything else.
-  acquire(&p->lock);
-  struct proc *original_parent = p->parent;
-  release(&p->lock);
-  
-  // we need the parent's lock in order to wake it up from wait().
-  // the parent-then-child rule says we have to lock it first.
-  acquire(&original_parent->lock);
+    acquire(&initproc->lock);  // 获取init进程的锁
+    wakeup1(initproc);  // 唤醒init进程
+    release(&initproc->lock);  // 释放init进程的锁
 
-  acquire(&p->lock);
+    acquire(&p->lock);
+    struct proc *original_parent = p->parent;  // 复制父进程指针
+    release(&p->lock);
 
-  // Give any children to init.
-  reparent(p);
+    acquire(&original_parent->lock);  // 获取父进程的锁
+    acquire(&p->lock);
 
-  // Parent might be sleeping in wait().
-  wakeup1(original_parent);
+    reparent(p);  // 将所有子进程交给init进程
 
-  p->xstate = status;
-  p->state = ZOMBIE;
+    wakeup1(original_parent);  // 唤醒父进程
+    p->xstate = status;  // 设置退出状态
+    p->state = ZOMBIE;  // 将进程状态设置为僵尸态
+    release(&original_parent->lock);  // 释放父进程的锁
 
-  release(&original_parent->lock);
-
-  // Jump into the scheduler, never to return.
-  sched();
-  panic("zombie exit");
+    sched();  // 跳转到调度器，不再返回
+    panic("zombie exit");  // 抛出panic异常（永远不会执行到这一行）
 }
 
 // Wait for a child process to exit and return its pid.
@@ -447,7 +484,7 @@ wait(uint64 addr)
       release(&p->lock);
       return -1;
     }
-    
+
     // Wait for a child to exit.
     sleep(p, &p->lock);  //DOC: wait-sleep
   }
@@ -465,12 +502,12 @@ scheduler(void)
 {
   struct proc *p;
   struct cpu *c = mycpu();
-  
+
   c->proc = 0;
   for(;;){
     // Avoid deadlock by ensuring that devices can interrupt.
     intr_on();
-    
+
     int nproc = 0;
     for(p = proc; p < &proc[NPROC]; p++) {
       acquire(&p->lock);
@@ -563,7 +600,7 @@ void
 sleep(void *chan, struct spinlock *lk)
 {
   struct proc *p = myproc();
-  
+
   // Must acquire p->lock in order to
   // change p->state and then call sched.
   // Once we hold p->lock, we can be
