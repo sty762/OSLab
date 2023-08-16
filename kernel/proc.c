@@ -270,40 +270,40 @@ growproc(int n)
 // Sets up child kernel stack to return as if from fork() system call.
 int fork(void)
 {
-  int i, pid; // 进程ID和循环变量
-  struct proc *np; // 子进程指针
-  struct proc *p = myproc(); // 当前进程指针
+  int i, pid;
+  struct proc *np; // ptr to child process
+  struct proc *p = myproc(); // ptr to current process
 
-  // 分配新的进程
+  // allocate new process
   if ((np = allocproc()) == 0) {
-    return -1; // 分配失败，返回-1
+    return -1; // bad allocation
   }
 
-  // 复制父进程的用户内存到子进程
+  // process copy
   if (uvmcopy(p->pagetable, np->pagetable, p->sz) < 0) {
     freeproc(np);
     release(&np->lock);
-    return -1; // 复制失败，释放子进程并返回-1
+    return -1; // copy failed
   }
-  np->sz = p->sz; // 设置子进程的用户内存大小与父进程一致
+  np->sz = p->sz; // set process mem
 
-  np->parent = p; // 设置子进程的父进程为当前进程
+  np->parent = p; // set current process
 
-  // 复制父进程的保存的用户寄存器
+  // copy register
   *(np->trapframe) = *(p->trapframe);
 
-  // 使子进程在返回时返回0
+  // return value
   np->trapframe->a0 = 0;
 
-  // 增加打开文件描述符的引用计数
+  // rc ++
   for (i = 0; i < NOFILE; i++) {
     if (p->ofile[i]) {
       np->ofile[i] = filedup(p->ofile[i]);
     }
   }
-  np->cwd = idup(p->cwd); // 复制当前工作目录
+  np->cwd = idup(p->cwd); // copy directory
 
-  // 复制所有的VMA（虚拟内存区域）
+  // copy vma
   for (i = 0; i < NVMA; ++i) {
     if (p->vma[i].addr) {
       np->vma[i] = p->vma[i];
@@ -311,15 +311,15 @@ int fork(void)
     }
   }
 
-  safestrcpy(np->name, p->name, sizeof(p->name)); // 复制进程名字
+  safestrcpy(np->name, p->name, sizeof(p->name)); // copy process name
 
-  pid = np->pid; // 获取子进程的ID
+  pid = np->pid; // get child pid
 
-  np->state = RUNNABLE; // 设置子进程为可运行状态
+  np->state = RUNNABLE; // set child state
 
-  release(&np->lock); // 释放子进程的锁
+  release(&np->lock); // release child lock
 
-  return pid; // 返回子进程的ID
+  return pid; // return child pid
 }
 
 
@@ -354,23 +354,23 @@ reparent(struct proc *p)
 // until its parent calls wait().
 void exit(int status)
 {
-    struct proc *p = myproc();  // 获取当前进程指针
+    struct proc *p = myproc();  // ptr to current process
     int i;
-    struct vm_area* vma;  // 虚拟内存区域指针
-    uint maxsz = ((MAXOPBLOCKS - 1 - 1 - 2) / 2) * BSIZE;  // 最大大小
+    struct vm_area* vma;  // vm ptr
+    uint maxsz = ((MAXOPBLOCKS - 1 - 1 - 2) / 2) * BSIZE;  // max size
     uint64 va;
     uint n, n1, r;
 
-    if(p == initproc)  // 如果当前进程为init进程，则抛出panic异常
+    if(p == initproc)  // init process
         panic("init exiting");
 
-    for (i = 0; i < NVMA; ++i) {  // 遍历进程的虚拟内存区域
+    for (i = 0; i < NVMA; ++i) {  // traverse vm
         if (p->vma[i].addr == 0) {
             continue;
         }
         vma = &p->vma[i];
 
-        if ((vma->flags & MAP_SHARED)) {  // 如果该区域是共享区域
+        if ((vma->flags & MAP_SHARED)) {  // if shared mem
             for (va = vma->addr; va < vma->addr + vma->len; va += PGSIZE) {
                 if (uvmgetdirty(p->pagetable, va) == 0) {
                     continue;
@@ -391,17 +391,17 @@ void exit(int status)
             }
         }
 
-        uvmunmap(p->pagetable, vma->addr, (vma->len - 1) / PGSIZE + 1, 1);  // 取消虚拟内存区域的映射
+        uvmunmap(p->pagetable, vma->addr, (vma->len - 1) / PGSIZE + 1, 1);  // cancel reflection
         vma->addr = 0;
         vma->len = 0;
         vma->offset = 0;
         vma->flags = 0;
         vma->offset = 0;
-        fileclose(vma->f);  // 关闭文件
+        fileclose(vma->f);  // close file
         vma->f = 0;
     }
 
-    for(int fd = 0; fd < NOFILE; fd++){  // 关闭所有打开的文件
+    for(int fd = 0; fd < NOFILE; fd++){  // close files
         if(p->ofile[fd]){
             struct file *f = p->ofile[fd];
             fileclose(f);
@@ -410,30 +410,30 @@ void exit(int status)
     }
 
     begin_op();
-    iput(p->cwd);  // 释放当前工作目录
+    iput(p->cwd);  // release directory
     end_op();
     p->cwd = 0;
 
-    acquire(&initproc->lock);  // 获取init进程的锁
-    wakeup1(initproc);  // 唤醒init进程
-    release(&initproc->lock);  // 释放init进程的锁
+    acquire(&initproc->lock);  // get lock
+    wakeup1(initproc);  // wake init process
+    release(&initproc->lock);  // release lock
 
     acquire(&p->lock);
-    struct proc *original_parent = p->parent;  // 复制父进程指针
+    struct proc *original_parent = p->parent;  // copy parent ptr
     release(&p->lock);
 
-    acquire(&original_parent->lock);  // 获取父进程的锁
+    acquire(&original_parent->lock);  // get parent lock
     acquire(&p->lock);
 
-    reparent(p);  // 将所有子进程交给init进程
+    reparent(p);  // reparent children
 
-    wakeup1(original_parent);  // 唤醒父进程
-    p->xstate = status;  // 设置退出状态
-    p->state = ZOMBIE;  // 将进程状态设置为僵尸态
-    release(&original_parent->lock);  // 释放父进程的锁
+    wakeup1(original_parent);  // wake parent process
+    p->xstate = status;  // set satus
+    p->state = ZOMBIE;  // set process state to zombie
+    release(&original_parent->lock);  // release parent lock
 
-    sched();  // 跳转到调度器，不再返回
-    panic("zombie exit");  // 抛出panic异常（永远不会执行到这一行）
+    sched();  // schedule
+    panic("zombie exit");  // exception(which should never exe)
 }
 
 // Wait for a child process to exit and return its pid.
