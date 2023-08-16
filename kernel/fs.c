@@ -380,28 +380,27 @@ static uint bmap(struct inode *ip, uint bn)
   struct buf *bp;
 
   if(bn < NDIRECT){
-    // 如果逻辑块号 bn 小于 NDIRECT（12），则直接返回对应的物理块号
     if((addr = ip->addrs[bn]) == 0)
-      ip->addrs[bn] = addr = balloc(ip->dev); // 如果物理块号为0，则分配一个新的物理块
+      ip->addrs[bn] = addr = balloc(ip->dev); // allocate new block
     return addr;
   }
   bn -= NDIRECT;
 
   if(bn < NINDIRECT){
-    // 加载间接块（indirect block），如果需要则进行分配
+    // load indirect block
     if((addr = ip->addrs[NDIRECT]) == 0)
-      ip->addrs[NDIRECT] = addr = balloc(ip->dev); // 如果物理块号为0，则分配一个新的物理块
-    bp = bread(ip->dev, addr); // 读取间接块的数据到缓冲区
+      ip->addrs[NDIRECT] = addr = balloc(ip->dev); // allocate new block
+    bp = bread(ip->dev, addr); // read indirect block to buffer
     a = (uint*)bp->data;
     if((addr = a[bn]) == 0){
-      a[bn] = addr = balloc(ip->dev); // 如果物理块号为0，则分配一个新的物理块
-      log_write(bp); // 写入对间接块的更改
+      a[bn] = addr = balloc(ip->dev); // allocate new block
+      log_write(bp); // update indirect block
     }
-    brelse(bp); // 释放缓冲区
+    brelse(bp); // release buffer
     return addr;
   }
 
-  panic("bmap: out of range"); // 如果逻辑块号超出范围，则触发 panic（紧急情况下的错误处理）
+  panic("bmap: out of range"); // panic
 }
 
 
