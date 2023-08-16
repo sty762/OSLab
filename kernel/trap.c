@@ -15,6 +15,9 @@ extern char trampoline[], uservec[], userret[];
 void kernelvec();
 
 extern int devintr();
+extern pte_t *walk(pagetable_t, uint64, int);
+extern void *memmove(void *, const void *, uint);
+extern int mappages(pagetable_t, uint64, uint64, uint64, int);
 
 void
 trapinit(void)
@@ -33,55 +36,99 @@ trapinithart(void)
 // handle an interrupt, exception, or system call from user space.
 // called from trampoline.S
 //
-void
-usertrap(void)
+extern uint8 referencecount[PHYSTOP/PGSIZE];
+void usertrap(void)
 {
   int which_dev = 0;
 
-  if((r_sstatus() & SSTATUS_SPP) != 0)
+  // check exception under user mode
+  if ((r_sstatus() & SSTATUS_SPP) != 0)
     panic("usertrap: not from user mode");
 
-  // send interrupts and exceptions to kerneltrap(),
-  // since we're now in the kernel.
   w_stvec((uint64)kernelvec);
 
   struct proc *p = myproc();
-  
-  // save user program counter.
-  p->trapframe->epc = r_sepc();
-  
-  if(r_scause() == 8){
-    // system call
 
-    if(p->killed)
+  // save counter
+  p->trapframe->epc = r_sepc();
+
+  if (r_scause() == 8){
+
+    if (p->killed)
       exit(-1);
 
-    // sepc points to the ecall instruction,
-    // but we want to return to the next instruction.
+    // sepc pointing to ecall
     p->trapframe->epc += 4;
 
-    // an interrupt will change sstatus &c registers,
-    // so don't enable until done with those registers.
     intr_on();
 
     syscall();
-  } else if((which_dev = devintr()) != 0){
+  } else if ((which_dev = devintr()) != 0){
     // ok
-  } else {
+  } else if (r_scause() == 12 || r_scause() == 15){
+    // deal with cow
+    pte_t *pte;
+    uint64 pa, va;
+    // uint64 va;
+    uint flags;
+    char *mem;
+
+    va = r_stval();
+    if (va >= MAXVA)
+    {
+      p->killed = 1;
+      exit(-1);
+    }
+
+    if ((pte = walk(p->pagetable, va, 0)) == 0)
+    {
+      p->killed = 1;
+      exit(-1);
+    }
+    if ((*pte & PTE_V) == 0)
+    {
+      p->killed = 1;
+      exit(-1);
+    }
+    if ((*pte & PTE_COW) == 0)
+    {
+      p->killed = 1;
+      exit(-1);
+    }
+
+    pa = PTE2PA(*pte);
+    flags = PTE_FLAGS(*pte) | PTE_W;
+    flags &= ~(PTE_COW);
+
+    if ((mem = kalloc()) == 0)
+    {
+      p->killed = 1;
+      exit(-1);
+    }
+
+    memmove(mem, (char*)pa, PGSIZE);
+    uvmunmap(p->pagetable, PGROUNDDOWN(va), 1, 1);
+
+    if (mappages(p->pagetable, PGROUNDDOWN(va), PGSIZE, (uint64)mem, flags) != 0){
+      kfree(mem);
+      panic("cowhandler: mappages failed");
+    }
+  }
+  else {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
     p->killed = 1;
   }
 
-  if(p->killed)
+  if (p->killed)
     exit(-1);
 
-  // give up the CPU if this is a timer interrupt.
-  if(which_dev == 2)
+  if (which_dev == 2)
     yield();
 
   usertrapret();
 }
+
 
 //
 // return to user space
